@@ -1,16 +1,23 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
 
 from app.config import get_settings
+from app.core.ids import new_opaque_token
+from app.core.mfa import generate_totp_secret
 from app.core.plans import PUBLIC_PLANS, get_plan
+from app.core.redis import delete_key, get_json, set_json
+from app.core.security import hash_token
 from app.db.models import (
     Department,
+    Invite,
     Membership,
     MembershipStatus,
+    RefreshToken,
     SignupRequest,
     SubscriptionPayment,
     SubscriptionPaymentStatus,
@@ -21,6 +28,7 @@ from app.db.models import (
 from app.dependencies import AuthContext
 from app.schemas.admin import CreateUserRequest
 from app.schemas.owner import (
+    ImpersonationSessionOut,
     PlanDefinitionOut,
     PlatformHealthOut,
     PlatformInvoiceOut,
@@ -30,10 +38,11 @@ from app.schemas.owner import (
     SiteInviteOut,
     SiteUsageOut,
 )
-from app.services import admin_service
+from app.services import admin_service, notification_service
 from app.services.subscription_service import to_subscription_out
 
 settings = get_settings()
+_IMPERSONATION_TTL = 60 * 60 * 4
 
 
 class OwnerError(Exception):
@@ -209,43 +218,271 @@ async def create_site_invite(
     )
 
 
+def _invite_status(invite: Invite) -> str:
+    now = datetime.now(UTC)
+    if invite.revoked_at is not None:
+        return "revoked"
+    if invite.accepted_at is not None:
+        return "accepted"
+    expires = invite.expires_at if invite.expires_at.tzinfo else invite.expires_at.replace(tzinfo=UTC)
+    if expires < now:
+        return "expired"
+    return "pending"
+
+
 async def list_site_invites(db: AsyncSession, workplace_id: str) -> list[SiteInviteOut]:
     result = await db.execute(
-        select(User)
-        .join(Membership, Membership.user_id == User.id)
-        .where(
-            Membership.workplace_id == workplace_id,
-            Membership.status == MembershipStatus.invited,
-        )
+        select(Invite)
+        .join(Membership, Membership.id == Invite.membership_id)
+        .where(Membership.workplace_id == workplace_id)
+        .options(selectinload(Invite.user))
+        .order_by(Invite.created_at.desc())
     )
-    users = list(result.scalars().unique().all())
     outs: list[SiteInviteOut] = []
-    for user in users:
-        mem = next(
-            (m for m in user.memberships if m.workplace_id == workplace_id),
-            None,
-        )
+    for invite in result.scalars().unique().all():
+        user = invite.user
         outs.append(
             SiteInviteOut(
-                id=mem.id if mem else user.id,
+                id=invite.id,
                 workplace_id=workplace_id,
-                email=user.email,
-                display_name=user.display_name,
-                status="pending",
+                email=user.email if user else "",
+                display_name=user.display_name if user else "",
+                status=_invite_status(invite),  # type: ignore[arg-type]
                 invite_url=None,
-                created_at=user.created_at,
-                expires_at=None,
+                created_at=invite.created_at,
+                expires_at=invite.expires_at,
             )
         )
     return outs
 
 
+async def resend_site_invite(db: AsyncSession, invite_id: str) -> SiteInviteOut:
+    result = await db.execute(
+        select(Invite)
+        .where(Invite.id == invite_id)
+        .options(selectinload(Invite.user))
+    )
+    invite = result.scalar_one_or_none()
+    if invite is None:
+        raise OwnerError("Invite not found.", status_code=404)
+    if _invite_status(invite) != "pending":
+        raise OwnerError("Only pending invites can be resent.")
+    token = new_opaque_token()
+    invite.token_hash = hash_token(token)
+    invite.expires_at = datetime.now(UTC) + timedelta(seconds=settings.invite_token_ttl_seconds)
+    invite_url = f"/invite?token={token}"
+    user = invite.user
+    mem = await db.get(Membership, invite.membership_id)
+    workplace_id = mem.workplace_id if mem else ""
+    if user and user.phone:
+        await notification_service.send_invite_sms(db, phone=user.phone, invite_url=invite_url)
+    await db.commit()
+    return SiteInviteOut(
+        id=invite.id,
+        workplace_id=workplace_id,
+        email=user.email if user else "",
+        display_name=user.display_name if user else "",
+        status="pending",
+        invite_url=invite_url,
+        created_at=invite.created_at,
+        expires_at=invite.expires_at,
+    )
+
+
+async def revoke_site_invite(db: AsyncSession, invite_id: str) -> SiteInviteOut:
+    result = await db.execute(
+        select(Invite)
+        .where(Invite.id == invite_id)
+        .options(selectinload(Invite.user))
+    )
+    invite = result.scalar_one_or_none()
+    if invite is None:
+        raise OwnerError("Invite not found.", status_code=404)
+    invite.revoked_at = datetime.now(UTC)
+    mem = await db.get(Membership, invite.membership_id)
+    if mem and mem.status == MembershipStatus.invited:
+        mem.status = MembershipStatus.revoked
+    user = invite.user
+    await db.commit()
+    return SiteInviteOut(
+        id=invite.id,
+        workplace_id=mem.workplace_id if mem else "",
+        email=user.email if user else "",
+        display_name=user.display_name if user else "",
+        status="revoked",
+        invite_url=None,
+        created_at=invite.created_at,
+        expires_at=invite.expires_at,
+    )
+
+
 async def get_security_settings(db: AsyncSession, auth: AuthContext) -> OwnerSecuritySettingsOut:
     user = await db.get(User, auth.user_id)
+    result = await db.execute(
+        select(RefreshToken)
+        .where(
+            RefreshToken.user_id == auth.user_id,
+            RefreshToken.revoked_at.is_(None),
+        )
+        .order_by(RefreshToken.created_at.desc())
+        .limit(20)
+    )
+    sessions = []
+    for row in result.scalars().all():
+        sessions.append(
+            {
+                "id": row.id,
+                "device": row.user_agent or "Unknown device",
+                "location": row.ip_address or "—",
+                "lastActiveAt": row.created_at.isoformat() if row.created_at else "",
+                "current": row.membership_id == auth.membership_id,
+            }
+        )
     return OwnerSecuritySettingsOut(
         two_factor_enabled=bool(user and user.mfa_enabled),
-        sessions=[],
+        sessions=sessions,
     )
+
+
+async def set_two_factor_enabled(
+    db: AsyncSession,
+    auth: AuthContext,
+    enabled: bool,
+) -> OwnerSecuritySettingsOut:
+    user = await db.get(User, auth.user_id)
+    if user is None:
+        raise OwnerError("User not found.", status_code=404)
+    if enabled:
+        if not user.mfa_secret:
+            user.mfa_secret = generate_totp_secret()
+        # Confirm via /auth/mfa/confirm in production; demo enables immediately.
+        if settings.allow_otp_demo:
+            user.mfa_enabled = True
+        else:
+            raise OwnerError(
+                "Complete MFA setup via POST /api/v1/auth/mfa/setup and /mfa/confirm.",
+                status_code=400,
+            )
+    else:
+        user.mfa_enabled = False
+        user.mfa_secret = None
+    await db.commit()
+    return await get_security_settings(db, auth)
+
+
+async def start_impersonation(
+    db: AsyncSession,
+    auth: AuthContext,
+    *,
+    user_id: str,
+    membership_id: str,
+    reason: str,
+) -> ImpersonationSessionOut:
+    from app.services import auth_service
+
+    if not reason.strip():
+        raise OwnerError("Support reason is required.")
+    target = await db.get(User, user_id)
+    if target is None:
+        raise OwnerError("User not found.", status_code=404)
+    result = await db.execute(
+        select(Membership)
+        .where(Membership.id == membership_id, Membership.user_id == user_id)
+        .options(selectinload(Membership.workplace))
+    )
+    membership = result.scalar_one_or_none()
+    if membership is None:
+        raise OwnerError("Membership not found.", status_code=404)
+    if "owner" in (membership.roles or []):
+        raise OwnerError("Cannot impersonate the platform owner.")
+    if membership.status != MembershipStatus.active:
+        raise OwnerError("Target membership is not active.")
+
+    tokens = await auth_service._issue_tokens(  # noqa: SLF001 — shared token issuer
+        db,
+        user=target,
+        membership=membership,
+    )
+    await db.commit()
+    started = datetime.now(UTC).isoformat()
+    payload = {
+        "active": True,
+        "targetUserId": target.id,
+        "targetEmail": target.email,
+        "targetWorkplaceId": membership.workplace_id,
+        "targetWorkplaceName": membership.workplace.display_name if membership.workplace else None,
+        "ownerUserId": auth.user_id,
+        "ownerMembershipId": auth.membership_id,
+        "startedAt": started,
+        "reason": reason.strip(),
+    }
+    await set_json(f"impersonation:{auth.user_id}", payload, ttl_seconds=_IMPERSONATION_TTL)
+    return ImpersonationSessionOut(
+        active=True,
+        target_user_id=target.id,
+        target_email=target.email,
+        target_workplace_id=membership.workplace_id,
+        target_workplace_name=membership.workplace.display_name if membership.workplace else None,
+        owner_user_id=auth.user_id,
+        owner_membership_id=auth.membership_id,
+        started_at=datetime.fromisoformat(started),
+        reason=reason.strip(),
+        access_token=tokens.access_token,
+        refresh_token=tokens.refresh_token,
+    )
+
+
+async def end_impersonation(db: AsyncSession, auth: AuthContext) -> ImpersonationSessionOut:
+    from app.services import auth_service
+
+    key = f"impersonation:{auth.user_id}"
+    stored = await get_json(key)
+    await delete_key(key)
+    owner = await db.get(User, auth.user_id)
+    if owner is None:
+        return ImpersonationSessionOut(active=False)
+    result = await db.execute(
+        select(Membership)
+        .where(Membership.id == auth.membership_id, Membership.user_id == auth.user_id)
+        .options(selectinload(Membership.workplace))
+    )
+    membership = result.scalar_one_or_none()
+    if membership is None:
+        return ImpersonationSessionOut(active=False)
+    tokens = await auth_service._issue_tokens(db, user=owner, membership=membership)
+    await db.commit()
+    return ImpersonationSessionOut(
+        active=False,
+        owner_user_id=auth.user_id,
+        owner_membership_id=auth.membership_id,
+        access_token=tokens.access_token,
+        refresh_token=tokens.refresh_token,
+        reason=(stored or {}).get("reason") if isinstance(stored, dict) else None,
+    )
+
+
+async def get_impersonation(auth: AuthContext) -> ImpersonationSessionOut:
+    stored = await get_json(f"impersonation:{auth.user_id}")
+    if not stored or not stored.get("active"):
+        return ImpersonationSessionOut(active=False)
+    started = stored.get("startedAt")
+    return ImpersonationSessionOut(
+        active=True,
+        target_user_id=stored.get("targetUserId"),
+        target_email=stored.get("targetEmail"),
+        target_workplace_id=stored.get("targetWorkplaceId"),
+        target_workplace_name=stored.get("targetWorkplaceName"),
+        owner_user_id=stored.get("ownerUserId"),
+        owner_membership_id=stored.get("ownerMembershipId"),
+        started_at=datetime.fromisoformat(started) if started else None,
+        reason=stored.get("reason"),
+    )
+
+
+async def summarize_workplace(db: AsyncSession, workplace_id: str) -> dict:
+    usage = await get_site_usage(db, workplace_id)
+    billing = await get_site_billing(db, workplace_id)
+    return {"usage": usage, "billing": billing}
 
 
 async def list_signup_requests(db: AsyncSession) -> list[SignupRequestOwnerOut]:

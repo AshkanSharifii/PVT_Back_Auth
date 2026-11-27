@@ -48,7 +48,13 @@ class CreateUserRequest(CamelModel):
 
 
 class SetUserStatusRequest(CamelModel):
-    status: MembershipStatusLit
+    """active | invited | suspended | expired | revoked — also accepts ban→suspended, unban→active."""
+
+    status: str = Field(min_length=1)
+
+
+class BanUserRequest(CamelModel):
+    reason: str | None = None
 
 
 class UpdateRolesRequest(CamelModel):
@@ -119,6 +125,15 @@ class AdminSubscriptionOut(CamelModel):
     period_ends_at: datetime | None = None
     days_remaining: int
     last_payment_at: datetime | None = None
+    # Present when renew/change-plan needs a live ZarinPal redirect.
+    payment_url: str | None = None
+    payment_authority: str | None = None
+    payment_id: str | None = None
+    payment_demo: bool | None = None
+
+
+class ChangeSubscriptionPlanRequest(CamelModel):
+    plan: SitePlan
 
 
 class DashboardStatsOut(CamelModel):

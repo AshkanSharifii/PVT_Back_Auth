@@ -7,6 +7,8 @@ from app.core.permissions import ASSIGNABLE_ROLES, ROLE_PERMISSIONS
 from app.db.session import get_db
 from app.dependencies import AuthContext, require_permission, require_roles
 from app.schemas.admin import (
+    BanUserRequest,
+    ChangeSubscriptionPlanRequest,
     CreateDepartmentRequest,
     CreateUserRequest,
     CreateWorkplaceRequest,
@@ -94,6 +96,46 @@ async def set_user_status(
         _raise(exc)
 
 
+@router.post("/users/{user_id}/ban")
+async def ban_user(
+    user_id: str,
+    payload: BanUserRequest | None = None,
+    auth: AuthContext = Depends(require_permission("users.manage")),
+    db: AsyncSession = Depends(get_db),
+):
+    """Admin/owner ban (suspend) — blocks login and kills sessions."""
+    _ = payload  # optional reason reserved for audit later
+    try:
+        return await admin_service.ban_user(db, auth, user_id)
+    except AdminError as exc:
+        _raise(exc)
+
+
+@router.post("/users/{user_id}/unban")
+async def unban_user(
+    user_id: str,
+    auth: AuthContext = Depends(require_permission("users.manage")),
+    db: AsyncSession = Depends(get_db),
+):
+    try:
+        return await admin_service.unban_user(db, auth, user_id)
+    except AdminError as exc:
+        _raise(exc)
+
+
+@router.delete("/users/{user_id}")
+async def delete_user(
+    user_id: str,
+    auth: AuthContext = Depends(require_roles("owner")),
+    db: AsyncSession = Depends(get_db),
+):
+    """Owner-only soft delete (revoked). Admins should ban instead."""
+    try:
+        return await admin_service.delete_user(db, auth, user_id)
+    except AdminError as exc:
+        _raise(exc)
+
+
 @router.patch("/users/{user_id}/memberships/{membership_id}/roles")
 async def update_roles(
     user_id: str,
@@ -168,6 +210,28 @@ async def update_workplace(
         _raise(exc)
 
 
+@router.delete("/workplaces/{workplace_id}")
+async def delete_workplace(
+    workplace_id: str,
+    auth: AuthContext = Depends(require_roles("owner")),
+    db: AsyncSession = Depends(get_db),
+):
+    try:
+        return await admin_service.delete_workplace(db, auth, workplace_id)
+    except AdminError as exc:
+        _raise(exc)
+
+
+@router.get("/audit")
+async def list_audit(
+    auth: AuthContext = Depends(require_roles("admin", "owner")),
+    db: AsyncSession = Depends(get_db),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(50, ge=1, le=200),
+):
+    return await admin_service.list_audit(db, auth, page=page, page_size=page_size)
+
+
 @router.get("/departments")
 async def list_departments(
     workplace_id: str | None = None,
@@ -198,3 +262,31 @@ async def get_subscription(
     db: AsyncSession = Depends(get_db),
 ):
     return await admin_service.admin_get_subscription(db, auth)
+
+
+@router.post("/subscription/renew")
+async def renew_subscription(
+    auth: AuthContext = Depends(require_permission("subscription.manage")),
+    db: AsyncSession = Depends(get_db),
+):
+    """Extend current plan (demo applies immediately; live returns paymentUrl)."""
+    try:
+        from app.services.subscription_service import SubscriptionError
+
+        return await admin_service.admin_renew_subscription(db, auth)
+    except SubscriptionError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.message) from exc
+
+
+@router.post("/subscription/change-plan")
+async def change_subscription_plan(
+    payload: ChangeSubscriptionPlanRequest,
+    auth: AuthContext = Depends(require_permission("subscription.manage")),
+    db: AsyncSession = Depends(get_db),
+):
+    try:
+        from app.services.subscription_service import SubscriptionError
+
+        return await admin_service.admin_change_subscription_plan(db, auth, payload.plan)
+    except SubscriptionError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.message) from exc

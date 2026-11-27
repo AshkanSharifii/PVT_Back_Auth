@@ -102,6 +102,88 @@ async def test_admin_subscription_and_zarinpal_demo_checkout():
         assert done["ok"] is True
         assert done["daysRemaining"] >= 30
 
+        renewed = await client.post(
+            "/api/v1/admin/subscription/renew",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert renewed.status_code == 200, renewed.text
+        assert renewed.json()["daysRemaining"] >= 30
+
+        changed = await client.post(
+            "/api/v1/admin/subscription/change-plan",
+            headers={"Authorization": f"Bearer {token}"},
+            json={"plan": "enterprise"},
+        )
+        assert changed.status_code == 200, changed.text
+        assert changed.json()["plan"] == "enterprise"
+
+
+@pytest.mark.asyncio
+async def test_admin_ban_change_role_and_owner_delete():
+    transport = ASGITransport(app=app)
+    suffix = uuid.uuid4().hex[:8]
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        admin_token = await _login(client, "admin")
+        created = await client.post(
+            "/api/v1/admin/users",
+            headers={"Authorization": f"Bearer {admin_token}"},
+            json={
+                "email": f"temp_{suffix}@example.com",
+                "displayName": "Temp User",
+                "phone": f"+98913{int(suffix, 16) % 10_000_000:07d}",
+                "password": "TempPass99",
+                "roles": ["staff"],
+                "workplaceId": "wp-clinic-a",
+                "delivery": "password",
+            },
+        )
+        assert created.status_code == 200, created.text
+        user_id = created.json()["id"]
+        membership_id = created.json()["memberships"][0]["id"]
+
+        roles = await client.patch(
+            f"/api/v1/admin/users/{user_id}/memberships/{membership_id}/roles",
+            headers={"Authorization": f"Bearer {admin_token}"},
+            json={"roles": ["doctor", "staff"]},
+        )
+        assert roles.status_code == 200, roles.text
+        assert set(roles.json()["memberships"][0]["roles"]) == {"doctor", "staff"}
+
+        banned = await client.post(
+            f"/api/v1/admin/users/{user_id}/ban",
+            headers={"Authorization": f"Bearer {admin_token}"},
+            json={},
+        )
+        assert banned.status_code == 200, banned.text
+        assert banned.json()["status"] == "suspended"
+
+        blocked = await client.post(
+            "/api/v1/auth/login",
+            json={"email": f"temp_{suffix}@example.com", "password": "TempPass99"},
+        )
+        assert blocked.status_code == 403
+
+        unbanned = await client.post(
+            f"/api/v1/admin/users/{user_id}/unban",
+            headers={"Authorization": f"Bearer {admin_token}"},
+        )
+        assert unbanned.status_code == 200
+        assert unbanned.json()["status"] == "active"
+
+        owner_token = await _login(client, "owner")
+        deleted = await client.delete(
+            f"/api/v1/admin/users/{user_id}",
+            headers={"Authorization": f"Bearer {owner_token}"},
+        )
+        assert deleted.status_code == 200, deleted.text
+        assert deleted.json()["status"] == "revoked"
+
+        admin_delete = await client.delete(
+            f"/api/v1/admin/users/{user_id}",
+            headers={"Authorization": f"Bearer {admin_token}"},
+        )
+        assert admin_delete.status_code == 403
+
 
 @pytest.mark.asyncio
 async def test_owner_panel_endpoints():

@@ -69,7 +69,7 @@ class SiteInviteCreateRequest(CamelModel):
     phone: str | None = Field(default=None, min_length=8, max_length=32)
     password: str | None = Field(default=None, min_length=8, max_length=128)
     roles: list[str] = Field(default_factory=lambda: ["admin"])
-    delivery: Literal["password", "invite"] = "password"
+    delivery: Literal["password", "invite"] = "invite"
 
 
 class SiteInviteOut(CamelModel):
@@ -87,6 +87,46 @@ class SiteInviteOut(CamelModel):
 class OwnerSecuritySettingsOut(CamelModel):
     two_factor_enabled: bool
     sessions: list[dict] = Field(default_factory=list)
+
+
+class SetTwoFactorRequest(CamelModel):
+    enabled: bool
+
+
+class ImpersonationStartRequest(CamelModel):
+    user_id: str
+    membership_id: str
+    reason: str = Field(min_length=3, max_length=500)
+
+
+class ImpersonationSessionOut(CamelModel):
+    active: bool
+    target_user_id: str | None = None
+    target_email: str | None = None
+    target_workplace_id: str | None = None
+    target_workplace_name: str | None = None
+    owner_user_id: str | None = None
+    owner_membership_id: str | None = None
+    started_at: datetime | None = None
+    reason: str | None = None
+    access_token: str | None = None
+    refresh_token: str | None = None
+
+
+class AuditEventOut(CamelModel):
+    id: str
+    user_id: str | None = None
+    event_type: str
+    payload: dict = Field(default_factory=dict)
+    ip_address: str | None = None
+    created_at: datetime
+
+
+class PaginatedAudit(CamelModel):
+    items: list[AuditEventOut]
+    total: int
+    page: int
+    page_size: int
 
 
 class SignupRequestOwnerOut(CamelModel):

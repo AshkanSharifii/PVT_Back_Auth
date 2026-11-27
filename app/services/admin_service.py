@@ -204,8 +204,7 @@ async def create_user(
     delivery = payload.delivery
     if delivery == "password" and (not payload.password or len(payload.password) < 8):
         raise AdminError("Password must be at least 8 characters.")
-    if delivery == "password" and not payload.phone:
-        raise AdminError("Phone is required to SMS credentials to the new user.")
+    # Phone is optional: when present, SMS credentials; otherwise admin shares password manually.
 
     existing = await db.execute(
         select(User).where(User.email == email).options(selectinload(User.memberships))
@@ -297,17 +296,53 @@ async def create_user(
             await notification_service.send_invite_sms(db, phone=phone, invite_url=invite_url)
     else:
         assert payload.password
-        result = await notification_service.send_user_credentials_sms(
-            db,
-            phone=payload.phone or "",
-            email=email,
-            password=payload.password,
-        )
-        sms_sent = bool(result.get("sent") or result.get("demo") or not settings.sms_live)
+        if payload.phone:
+            result = await notification_service.send_user_credentials_sms(
+                db,
+                phone=payload.phone,
+                email=email,
+                password=payload.password,
+            )
+            sms_sent = bool(result.get("sent") or result.get("demo") or not settings.sms_live)
+        else:
+            sms_sent = False
 
     await db.commit()
     user = await _load_user(db, user.id)
     return _user_out(user, invite_url=invite_url, sms_sent=sms_sent)
+
+
+def _normalize_status(raw: str) -> MembershipStatus:
+    value = (raw or "").strip().lower()
+    aliases = {
+        "ban": "suspended",
+        "banned": "suspended",
+        "unban": "active",
+        "unbanned": "active",
+        "delete": "revoked",
+        "deleted": "revoked",
+    }
+    value = aliases.get(value, value)
+    try:
+        return MembershipStatus(value)
+    except ValueError as exc:
+        raise AdminError(
+            "Invalid status. Use active, invited, suspended (ban), expired, or revoked."
+        ) from exc
+
+
+def _assert_admin_site_scope(auth: AuthContext, user: User) -> None:
+    """Site admins may only manage people who belong to their workplace."""
+    if "owner" in auth.roles:
+        return
+    if not any(m.workplace_id == auth.workplace_id for m in user.memberships):
+        raise AdminError("Admins may only manage users at their own site.", status_code=403)
+
+
+async def _kick_sessions(db: AsyncSession, user_id: str) -> None:
+    from app.services.auth_service import _revoke_all_refresh_tokens
+
+    await _revoke_all_refresh_tokens(db, user_id)
 
 
 async def set_user_status(
@@ -316,14 +351,61 @@ async def set_user_status(
     user_id: str,
     status: str,
 ) -> UserAccountOut:
+    if user_id == auth.user_id and _normalize_status(status) != MembershipStatus.active:
+        raise AdminError("You cannot ban or revoke your own account.", status_code=400)
     user = await _load_user(db, user_id)
     _assert_may_manage(auth, user)
-    try:
-        user.status = MembershipStatus(status)
-    except ValueError as exc:
-        raise AdminError("Invalid status.") from exc
+    _assert_admin_site_scope(auth, user)
+    new_status = _normalize_status(status)
+    user.status = new_status
+
+    # Keep site memberships aligned when banning / revoking.
+    if new_status in {MembershipStatus.suspended, MembershipStatus.revoked, MembershipStatus.expired}:
+        for membership in user.memberships:
+            if "owner" not in auth.roles and membership.workplace_id != auth.workplace_id:
+                continue
+            if "owner" in (membership.roles or []):
+                continue
+            membership.status = new_status
+        await _kick_sessions(db, user.id)
+    elif new_status == MembershipStatus.active:
+        for membership in user.memberships:
+            if "owner" not in auth.roles and membership.workplace_id != auth.workplace_id:
+                continue
+            if membership.status in {
+                MembershipStatus.suspended,
+                MembershipStatus.revoked,
+                MembershipStatus.expired,
+            }:
+                membership.status = MembershipStatus.active
+
     await db.commit()
+    user = await _load_user(db, user_id)
     return _user_out(user)
+
+
+async def ban_user(db: AsyncSession, auth: AuthContext, user_id: str) -> UserAccountOut:
+    return await set_user_status(db, auth, user_id, "suspended")
+
+
+async def unban_user(db: AsyncSession, auth: AuthContext, user_id: str) -> UserAccountOut:
+    return await set_user_status(db, auth, user_id, "active")
+
+
+async def delete_user(db: AsyncSession, auth: AuthContext, user_id: str) -> dict:
+    """Owner soft-deletes a user (revoked + sessions killed). Admins use ban instead."""
+    if "owner" not in auth.roles:
+        raise AdminError("Only the platform owner can delete users. Admins can ban instead.", status_code=403)
+    if user_id == auth.user_id:
+        raise AdminError("You cannot delete your own account.", status_code=400)
+    user = await _load_user(db, user_id)
+    _assert_may_manage(auth, user)
+    user.status = MembershipStatus.revoked
+    for membership in user.memberships:
+        membership.status = MembershipStatus.revoked
+    await _kick_sessions(db, user.id)
+    await db.commit()
+    return {"ok": True, "userId": user_id, "status": "revoked"}
 
 
 async def update_membership_roles(
@@ -344,6 +426,8 @@ async def update_membership_roles(
         raise AdminError("Membership not found.", status_code=404)
     if "owner" not in auth.roles and membership.workplace_id != auth.workplace_id:
         raise AdminError("Cannot manage memberships outside your site.", status_code=403)
+    if "owner" in (membership.roles or []):
+        raise AdminError("Platform owner memberships cannot be edited.", status_code=403)
     membership.roles = roles
     await db.commit()
     user = await _load_user(db, user_id)
@@ -363,7 +447,13 @@ async def remove_membership(
         raise AdminError("Membership not found.", status_code=404)
     if "owner" not in auth.roles and membership.workplace_id != auth.workplace_id:
         raise AdminError("Cannot manage memberships outside your site.", status_code=403)
+    if "owner" in (membership.roles or []):
+        raise AdminError("Platform owner memberships cannot be removed.", status_code=403)
     membership.status = MembershipStatus.revoked
+    # If no active memberships remain, suspend the account.
+    if not any(m.status == MembershipStatus.active for m in user.memberships if m.id != membership_id):
+        user.status = MembershipStatus.suspended
+        await _kick_sessions(db, user.id)
     await db.commit()
     user = await _load_user(db, user_id)
     return _user_out(user)
@@ -423,6 +513,54 @@ async def create_workplace(
     db.add(wp)
     await db.commit()
     return _workplace_out(wp)
+
+
+async def delete_workplace(db: AsyncSession, auth: AuthContext, workplace_id: str) -> dict:
+    if "owner" not in auth.roles:
+        raise AdminError("Only owners can delete workplaces.", status_code=403)
+    wp = await db.get(Workplace, workplace_id)
+    if wp is None:
+        raise AdminError("Workplace not found.", status_code=404)
+    # Soft-delete: deactivate site and revoke memberships (keep history).
+    wp.status = WorkplaceStatus.inactive
+    wp.subscription_status = "canceled"
+    result = await db.execute(select(Membership).where(Membership.workplace_id == workplace_id))
+    for membership in result.scalars().all():
+        membership.status = MembershipStatus.revoked
+    await db.commit()
+    return {"ok": True, "workplaceId": workplace_id, "status": "inactive"}
+
+
+async def list_audit(
+    db: AsyncSession,
+    auth: AuthContext,
+    *,
+    page: int = 1,
+    page_size: int = 50,
+) -> dict:
+    from app.db.models import AuthAuditEvent
+
+    page = max(1, page)
+    page_size = min(200, max(1, page_size))
+    total = (await db.execute(select(func.count()).select_from(AuthAuditEvent))).scalar_one()
+    result = await db.execute(
+        select(AuthAuditEvent)
+        .order_by(AuthAuditEvent.created_at.desc())
+        .offset((page - 1) * page_size)
+        .limit(page_size)
+    )
+    items = [
+        {
+            "id": row.id,
+            "userId": row.user_id,
+            "eventType": row.event_type,
+            "payload": row.payload or {},
+            "ipAddress": row.ip_address,
+            "createdAt": row.created_at,
+        }
+        for row in result.scalars().all()
+    ]
+    return {"items": items, "total": int(total or 0), "page": page, "pageSize": page_size}
 
 
 async def update_workplace(
@@ -585,3 +723,27 @@ async def dashboard_stats(db: AsyncSession, auth: AuthContext) -> DashboardStats
 
 async def admin_get_subscription(db: AsyncSession, auth: AuthContext):
     return await get_subscription(db, workplace_id=auth.workplace_id)
+
+
+async def admin_renew_subscription(db: AsyncSession, auth: AuthContext):
+    from app.services.subscription_service import renew_or_change_plan
+
+    return await renew_or_change_plan(
+        db,
+        workplace_id=auth.workplace_id,
+        requested_by_user_id=auth.user_id,
+        plan_id=None,
+        email=auth.email,
+    )
+
+
+async def admin_change_subscription_plan(db: AsyncSession, auth: AuthContext, plan: str):
+    from app.services.subscription_service import renew_or_change_plan
+
+    return await renew_or_change_plan(
+        db,
+        workplace_id=auth.workplace_id,
+        requested_by_user_id=auth.user_id,
+        plan_id=plan,
+        email=auth.email,
+    )

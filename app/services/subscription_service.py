@@ -97,6 +97,40 @@ async def get_subscription(db: AsyncSession, *, workplace_id: str) -> AdminSubsc
     return out
 
 
+async def renew_or_change_plan(
+    db: AsyncSession,
+    *,
+    workplace_id: str,
+    requested_by_user_id: str,
+    plan_id: str | None = None,
+    email: str | None = None,
+) -> AdminSubscriptionOut:
+    """Admin UI renew / change-plan.
+
+    Demo (empty merchant): checkout + verify immediately, return updated subscription.
+    Live: return current subscription plus paymentUrl for the browser redirect.
+    """
+    checkout = await start_checkout(
+        db,
+        workplace_id=workplace_id,
+        requested_by_user_id=requested_by_user_id,
+        plan_id=plan_id,
+        email=email,
+    )
+    if checkout.demo:
+        await verify_checkout(db, authority=checkout.authority, gateway_status="OK")
+        out = await get_subscription(db, workplace_id=workplace_id)
+        out.payment_demo = True
+        return out
+
+    out = await get_subscription(db, workplace_id=workplace_id)
+    out.payment_url = checkout.payment_url
+    out.payment_authority = checkout.authority
+    out.payment_id = checkout.payment_id
+    out.payment_demo = False
+    return out
+
+
 async def start_checkout(
     db: AsyncSession,
     *,

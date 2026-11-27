@@ -5,7 +5,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.session import get_db
 from app.dependencies import AuthContext, require_roles
-from app.schemas.owner import SiteInviteCreateRequest
+from app.schemas.owner import ImpersonationStartRequest, SetTwoFactorRequest, SiteInviteCreateRequest
 from app.services import admin_service, owner_service
 from app.services.admin_service import AdminError
 from app.services.owner_service import OwnerError
@@ -78,6 +78,18 @@ async def site_billing(
         _raise_owner(exc)
 
 
+@router.get("/sites/{workplace_id}/summary")
+async def site_summary(
+    workplace_id: str,
+    _: AuthContext = Depends(require_roles("owner")),
+    db: AsyncSession = Depends(get_db),
+):
+    try:
+        return await owner_service.summarize_workplace(db, workplace_id)
+    except OwnerError as exc:
+        _raise_owner(exc)
+
+
 @router.get("/invoices")
 async def invoices(
     _: AuthContext = Depends(require_roles("owner")),
@@ -117,9 +129,79 @@ async def list_invites(
     return await owner_service.list_site_invites(db, workplace_id)
 
 
+@router.post("/invites/{invite_id}/resend")
+async def resend_invite(
+    invite_id: str,
+    _: AuthContext = Depends(require_roles("owner")),
+    db: AsyncSession = Depends(get_db),
+):
+    try:
+        return await owner_service.resend_site_invite(db, invite_id)
+    except OwnerError as exc:
+        _raise_owner(exc)
+
+
+@router.post("/invites/{invite_id}/revoke")
+async def revoke_invite(
+    invite_id: str,
+    _: AuthContext = Depends(require_roles("owner")),
+    db: AsyncSession = Depends(get_db),
+):
+    try:
+        return await owner_service.revoke_site_invite(db, invite_id)
+    except OwnerError as exc:
+        _raise_owner(exc)
+
+
 @router.get("/security")
 async def security(
     auth: AuthContext = Depends(require_roles("owner")),
     db: AsyncSession = Depends(get_db),
 ):
     return await owner_service.get_security_settings(db, auth)
+
+
+@router.post("/security/two-factor")
+async def set_two_factor(
+    payload: SetTwoFactorRequest,
+    auth: AuthContext = Depends(require_roles("owner")),
+    db: AsyncSession = Depends(get_db),
+):
+    try:
+        return await owner_service.set_two_factor_enabled(db, auth, payload.enabled)
+    except OwnerError as exc:
+        _raise_owner(exc)
+
+
+@router.get("/impersonation")
+async def get_impersonation(auth: AuthContext = Depends(require_roles("owner"))):
+    return await owner_service.get_impersonation(auth)
+
+
+@router.post("/impersonation/start")
+async def start_impersonation(
+    payload: ImpersonationStartRequest,
+    auth: AuthContext = Depends(require_roles("owner")),
+    db: AsyncSession = Depends(get_db),
+):
+    try:
+        return await owner_service.start_impersonation(
+            db,
+            auth,
+            user_id=payload.user_id,
+            membership_id=payload.membership_id,
+            reason=payload.reason,
+        )
+    except OwnerError as exc:
+        _raise_owner(exc)
+
+
+@router.post("/impersonation/end")
+async def end_impersonation(
+    auth: AuthContext = Depends(require_roles("owner")),
+    db: AsyncSession = Depends(get_db),
+):
+    try:
+        return await owner_service.end_impersonation(db, auth)
+    except OwnerError as exc:
+        _raise_owner(exc)
